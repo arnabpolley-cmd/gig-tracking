@@ -8,9 +8,10 @@ export default async function handler(req, res) {
   const shopDomain = 's6bcd1-ar.myshopify.com';
 
   try {
+    console.log(`--- Processing Order: ${order.name} (${order.id}) ---`);
     const countryMap = { "NG": "Nigeria" };
 
-    // --- STEP 1: SENDER GEOLOCATION (Shopify Admin Location) ---
+    // --- STEP 1: SENDER GEOLOCATION ---
     const locRes = await fetch(`https://${shopDomain}/admin/api/2026-01/locations.json`, {
       headers: { "X-Shopify-Access-Token": adminToken }
     });
@@ -27,7 +28,7 @@ export default async function handler(req, res) {
     const sGeoData = await sGeoRes.json();
     const senderFound = sGeoData.results && sGeoData.results.length > 0;
 
-    // --- STEP 2: RECEIVER GEOLOCATION (Customer Address) ---
+    // --- STEP 2: RECEIVER GEOLOCATION ---
     const dest = order.shipping_address;
     const rCountry = countryMap[dest.country_code] || dest.country;
     const rAddrStr = [dest.address1, dest.address2, dest.city, dest.province, dest.zip, rCountry]
@@ -37,10 +38,11 @@ export default async function handler(req, res) {
     const rGeoData = await rGeoRes.json();
     const receiverFound = rGeoData.results && rGeoData.results.length > 0;
 
-    // Validation Check
+    console.log("Geocoding Status:", { senderFound, receiverFound });
+
     if (!senderFound || !receiverFound) {
-      console.error(`Geocoding failed. Sender:${senderFound}, Receiver:${receiverFound}`);
-      return res.status(400).json({ error: "Could not verify addresses via Google Maps." });
+      console.error(`Geocoding failed. S:${sAddrStr} | R:${rAddrStr}`);
+      return res.status(400).json({ error: "Address validation failed." });
     }
 
     const sCoords = sGeoData.results[0].geometry.location;
@@ -57,8 +59,7 @@ export default async function handler(req, res) {
     const fulfillmentResults = [];
 
     for (const item of order.line_items) {
-      console.log(`Creating GIG Waybill for: ${item.name}`);
-
+      // API call to GIG Logistics
       const gigRes = await fetch("https://dev-thirdpartynode.theagilitysystems.com/capture/preshipment", {
         method: "POST",
         headers: { "access-token": gigToken, "Content-Type": "application/json" },
@@ -85,9 +86,12 @@ export default async function handler(req, res) {
       const gigData = await gigRes.json();
       const trackingNumber = gigData.data?.WaybillNumber;
 
+      // Log the result for this specific item
+      console.log(`Item: ${item.name} | GIG Waybill: ${trackingNumber || "FAILED"}`);
+
       if (trackingNumber) {
         // --- STEP 5: PUSH TRACKING TO SHOPIFY ---
-        await fetch(`https://${shopDomain}/admin/api/2026-01/fulfillments.json`, {
+        const shopifyRes = await fetch(`https://${shopDomain}/admin/api/2026-01/fulfillments.json`, {
           method: "POST",
           headers: { "X-Shopify-Access-Token": adminToken, "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -107,10 +111,17 @@ export default async function handler(req, res) {
             }
           })
         });
+        
+        const shopifyData = await shopifyRes.json();
+        console.log(`Shopify Fulfillment Status for ${item.name}:`, shopifyRes.status);
+        
         fulfillmentResults.push({ item: item.name, waybill: trackingNumber });
+      } else {
+        console.error(`Failed to get Waybill for ${item.name}. GIG Response:`, JSON.stringify(gigData));
       }
     }
 
+    console.log(`--- Finished Processing Order ${order.name} ---`);
     return res.status(200).json({ success: true, fulfillments: fulfillmentResults });
 
   } catch (error) {
